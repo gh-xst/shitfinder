@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# shitfinder - find the shit you are looking for
+# Save to ~/bin/shitfinder and: chmod +x ~/bin/shitfinder
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Colors
+RED="\033[31m"
+YELLOW="\033[33m"
+GREEN="\033[32m"
+RESET="\033[0m"
+
+BAR_WIDTH=60
+
+show_help() {
+  cat <<'EOF'
+Usage: shitfinder -d <start-dir> -p "<pattern1> [pattern2 ...]" [options]
+
+Options:
+  -d, --directory DIR       Starting directory (required)
+  -p, --pattern PATTERN     Pattern(s). Quote them: -p '*.sh' or -p '*.sh doc*'
+                            Can repeat -p.
+  -n, --name-case-sensitive Use case-sensitive matching (default: case-insensitive)
+  -q, --quiet               Only print matches (suppress headers & spinner)
+  -h, --help                Show this help message
+
+Notes:
+ - QUOTE your patterns to prevent shell expansion (e.g. -p '*.sh').
+ - Searching / can be slow. Use sudo if you want to include everything.
+EOF
+}
+
+# Defaults
+start_dir=""
+declare -a patterns=()
+case_sensitive=0
+quiet=0
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--directory)
+      if [[ $# -lt 2 ]]; then echo "Error: $1 requires an argument." >&2; exit 1; fi
+      start_dir="$2"; shift 2 ;;
+    -p|--pattern)
+      if [[ $# -lt 2 ]]; then echo "Error: $1 requires an argument." >&2; exit 1; fi
+      # split quoted list into multiple patterns
+      read -ra parts <<< "$2"
+      for p in "${parts[@]}"; do patterns+=("$p"); done
+      shift 2 ;;
+    -n|--name-case-sensitive) case_sensitive=1; shift ;;
+    -q|--quiet) quiet=1; shift ;;
+    -h|--help) show_help; exit 0 ;;
+    --) shift; break ;;
+    *)
+      echo "Unknown option: $1" >&2
+      show_help; exit 1 ;;
+  esac
+done
+
+# Validate
+if [[ -z "$start_dir" || ${#patterns[@]} -eq 0 ]]; then
+  echo "Error: both -d <directory> and -p <pattern(s)> are required." >&2
+  show_help
+  exit 1
+fi
+if [[ ! -d "$start_dir" ]]; then
+  echo "Error: '$start_dir' is not a directory." >&2
+  exit 1
+fi
+
+# Detect likely shell expansion (user forgot to quote)
+for p in "${patterns[@]}"; do
+  if [[ "$p" != *[\*\?\[]* ]] && [[ -e "$p" ]]; then
+    echo "It looks like a pattern was shell-expanded before running the script."
+    echo "If you intended a wildcard search, re-run with the pattern quoted, e.g.:"
+    echo "  finddirs -d \"$start_dir\" -p \"*.sh\""
+    exit 2
+  fi
+done
+
+name_opt=$([[ $case_sensitive -eq 1 ]] && echo "-name" || echo "-iname")
+
+# spinner used during counting
+spinner_while() {
+  local pid=$1
+  local spin='|/-\' i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i + 1) % 4 ))
+    printf "\rCounting matches... %c" "${spin:i:1}" >&2
+    sleep 0.12
+  done
+  printf "\r%-40s\r" "" >&2
+}
+
+# draw_progress current total (fixed arithmetic, no ternary)
+draw_progress() {
+  local current=$1 total=$2 width=$BAR_WIDTH
+  local percent=0 filled=0
+
+  if (( total > 0 )); then
+    percent=$(( current * 100 / total ))
+    filled=$(( width * current / total ))
+  else
+    percent=100
+    filled=$width
+  fi
+  (( filled > width )) && filled=$width
+
+  local i colored=""
+  local third=$(( width / 3 ))
+
+  for ((i=1; i<=width; i++)); do
+    if (( i <= filled )); then
+      if   (( i <= third ));       then colored+="$(tput setaf 1)#$(tput sgr0)"
+      elif (( i <= 2*third ));     then colored+="$(tput setaf 3)#$(tput sgr0)"
+      else colored+="$(tput setaf 2)#$(tput sgr0)"
+      fi
+    else
+      colored+=" "
+    fi
+  done
+
+  printf "\r[%s] %3d%%" "$colored" "$percent" >&2
+}
+
+# Main loop per pattern
+for pattern in "${patterns[@]}"; do
+  (( quiet == 0 )) && printf "\nSearching for pattern: %s\n" "$pattern"
+
+  # Counting pass: write count to a temp file (count of null bytes = matches)
+  tmpf="$(mktemp)"
+  # ensure removal of tmpf on exit/failure
+  trap '[[ -f "$tmpf" ]] && rm -f "$tmpf"' EXIT
+
+  (
+    # this subshell writes the count to tmpf
+    find "$start_dir" \( -type f -o -type d \) $name_opt "$pattern" -print0 2>/dev/null | tr -cd '\0' | wc -c > "$tmpf"
+  ) &
+  cnt_pid=$!
+
+  if (( quiet == 0 )); then
+    spinner_while "$cnt_pid"
+  else
+    wait "$cnt_pid"
+  fi
+  wait "$cnt_pid" 2>/dev/null || true
+
+  total=0
+  if [[ -f "$tmpf" ]]; then
+    total=$(cat "$tmpf" 2>/dev/null || echo 0)
+    rm -f "$tmpf"
+  fi
+
+  if (( total == 0 )); then
+    (( quiet == 0 )) && echo "No matches found."
+    # clear trap for tmpf since it's removed
+    trap - EXIT
+    continue
+  fi
+
+  count=0
+  # Processing pass: stream null-delimited results; while-loop runs in current shell
+  while IFS= read -r -d '' path; do
+    count=$((count + 1))
+    draw_progress "$count" "$total"
+    # print match on its own line
+    if [[ -d "$path" ]]; then
+      printf "\n[DIR]  %s\n" "$path"
+    else
+      printf "\n[FILE] %s\n" "$path"
+    fi
+  done < <(find "$start_dir" \( -type f -o -type d \) $name_opt "$pattern" -print0 2>/dev/null)
+
+  # finish bar and newline
+  draw_progress "$total" "$total"
+  printf "\n"
+
+  # clear trap for tmpf (already removed)
+  trap - EXIT
+done
